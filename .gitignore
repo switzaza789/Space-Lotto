@@ -21,3 +21,14 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# User requested secrets and agent config
+.agent/
+.env
+.idea/
+.vscode/
+*.pem
+*.key
+*.cert
+secrets.json
+config.js
