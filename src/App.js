@@ -3,9 +3,9 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { ethers } from 'ethers';
 
 // ⚙️ CONFIGURATION
-const USE_MOCK = true;
-const CONTRACT_ADDRESS = "0xYourSpaceLottoAddress";
-const USDT_ADDRESS = "0xYourUsdtAddress";
+const USE_MOCK = process.env.REACT_APP_USE_MOCK === 'true';
+const CONTRACT_ADDRESS = process.env.REACT_APP_CONTRACT_ADDRESS;
+const USDT_ADDRESS = process.env.REACT_APP_USDT_ADDRESS;
 
 // 📜 ABI
 const LOTTO_ABI = [
@@ -13,7 +13,11 @@ const LOTTO_ABI = [
   "function currentRoundId() external view returns (uint256)",
   "function getUserTickets(uint256 _roundId, address _user) external view returns (uint256[])",
   "function claimPrize(uint256 _roundId) external",
-  "function rounds(uint256) external view returns (uint256 id, uint256 endTime, uint256 prizePool, uint256 winningNumber, bool isDrawn, bool hasWinner)"
+  "function rounds(uint256) external view returns (uint256 id, uint256 prizePool, uint256 winningNumber, bool isDrawn)",
+  "function hasClaimed(uint256, address) external view returns (bool)",
+  "function owner() view returns (address)",
+  "function drawWinner(uint256 _winningNumber) external",
+  "event WinnerDrawn(uint256 roundId, uint256 winningNumber, uint256 winnerCount, uint256 prizePerWinner)"
 ];
 
 const ERC20_ABI = [
@@ -112,13 +116,16 @@ const App = () => {
   const { playHover, playClick, playSuccess, playError } = useSound();
 
   const [walletAddress, setWalletAddress] = useState("");
-  const [currentPot, setCurrentPot] = useState(15420);
-  const [currentRoundDisplay, setCurrentRoundDisplay] = useState(5); // UI Display
+  const [currentPot, setCurrentPot] = useState(0);
+  const [currentRoundDisplay, setCurrentRoundDisplay] = useState("-"); // UI Display
   const [ticketNumber, setTicketNumber] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [isApproved, setIsApproved] = useState(false);
+  const [isOwner, setIsOwner] = useState(false); // 👑 Admin State
   const [myTickets, setMyTickets] = useState([]);
+  const [pastTickets, setPastTickets] = useState([]); // 📜 History State
   const [selectedTicket, setSelectedTicket] = useState(null);
+  const [viewHistoryTab, setViewHistoryTab] = useState(false); // 🆕 Tab State
   const [sharedViewMode, setSharedViewMode] = useState(false); // 🆕 Is viewing someone else's ticket?
   const [sharedRound, setSharedRound] = useState(null); // 🆕 Round from shared link
   const [mockHasClaimed, setMockHasClaimed] = useState(false);
@@ -126,29 +133,118 @@ const App = () => {
 
   const [winnerInfo, setWinnerInfo] = useState({ total: 0, count: 1, share: 0 });
 
+  // 🏆 Unclaimed Prize State
+  const [unclaimedPrize, setUnclaimedPrize] = useState(null); // { roundId, amount, winningNumber }
+
   const [provider, setProvider] = useState(null);
   const [signer, setSigner] = useState(null);
 
-  const [timeLeft, setTimeLeft] = useState({ days: 14, hours: 2, mins: 45, secs: 12 });
+  const [timeLeft, setTimeLeft] = useState({ days: 0, hours: 0, mins: 0, secs: 0 });
   const [notification, setNotification] = useState({ show: false, title: "", message: "", type: "info" });
 
-  // 🆕 History State (Mutable)
-  const [history, setHistory] = useState([
-    { round: 4, number: '4589', winner: '0x12...89A', prize: '12,000 USDT' },
-    { round: 3, number: '1102', winner: 'Rollover', prize: '8,500 USDT' },
-  ]);
+  // 🆕 History State
+  const [history, setHistory] = useState([]);
 
+  // ⏰ Persistent Countdown Timer
   useEffect(() => {
+    const ROUND_DURATION_MS = 14 * 24 * 60 * 60 * 1000; // 14 days in milliseconds
+    const STORAGE_KEY = "spacelotto_round_end";
+
+    // Get or create target end time
+    let targetTime = localStorage.getItem(STORAGE_KEY);
+    if (!targetTime) {
+      targetTime = Date.now() + ROUND_DURATION_MS;
+      localStorage.setItem(STORAGE_KEY, targetTime.toString());
+    } else {
+      targetTime = parseInt(targetTime);
+    }
+
+    const calculateTimeLeft = () => {
+      const diff = targetTime - Date.now();
+      if (diff <= 0) {
+        // Round ended - reset for new round
+        const newTarget = Date.now() + ROUND_DURATION_MS;
+        localStorage.setItem(STORAGE_KEY, newTarget.toString());
+        return { days: 14, hours: 0, mins: 0, secs: 0 };
+      }
+
+      const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+      const hours = Math.floor((diff % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+      const mins = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+      const secs = Math.floor((diff % (1000 * 60)) / 1000);
+      return { days, hours, mins, secs };
+    };
+
+    // Set initial value
+    setTimeLeft(calculateTimeLeft());
+
+    // Update every second
     const timer = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev.secs > 0) return { ...prev, secs: prev.secs - 1 };
-        if (prev.mins > 0) return { ...prev, mins: prev.mins - 1, secs: 59 };
-        if (prev.hours > 0) return { ...prev, hours: prev.hours - 1, mins: 59, secs: 59 };
-        if (prev.days > 0) return { ...prev, days: prev.days - 1, hours: 23, mins: 59, secs: 59 };
-        return prev;
-      });
+      setTimeLeft(calculateTimeLeft());
     }, 1000);
+
     return () => clearInterval(timer);
+  }, []);
+
+  // 🌐 Fetch Round & Pot on Page Load (No Wallet Required)
+  useEffect(() => {
+    const fetchPublicData = async () => {
+      if (USE_MOCK) {
+        setCurrentRoundDisplay(mockBlockchain.currentRoundId);
+        return;
+      }
+      try {
+        const readProvider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
+        const lotto = new ethers.Contract(CONTRACT_ADDRESS, LOTTO_ABI, readProvider);
+        const roundId = await lotto.currentRoundId();
+        setCurrentRoundDisplay(roundId.toString());
+
+        const roundData = await lotto.rounds(roundId);
+        const poolEth = parseFloat(ethers.formatUnits(roundData.prizePool, 18));
+        setCurrentPot(poolEth);
+
+        // 🏆 Also Fetch Global Winners (Public Data)
+        try {
+          const filter = lotto.filters.WinnerDrawn();
+          const events = await lotto.queryFilter(filter, 0, "latest");
+
+          const globalHistory = events.map(e => {
+            try {
+              // Try to access args as array first (more reliable)
+              const args = e.args;
+              if (!args || args.length < 4) return null;
+
+              return {
+                round: args[0]?.toString() || "?",
+                number: args[1]?.toString() || "????",
+                winnerCount: Number(args[2] || 0),
+                prize: args[3] ? parseFloat(ethers.formatUnits(args[3], 18)).toLocaleString() + " USDT" : "0 USDT"
+              };
+            } catch {
+              return null; // Skip invalid events
+            }
+          }).filter(Boolean).reverse().slice(0, 10);
+
+          if (globalHistory.length > 0) {
+            setHistory(globalHistory);
+          }
+        } catch (evtErr) {
+          // Silently ignore event errors to prevent spam
+        }
+
+      } catch (err) {
+        // Only log once, not every interval
+        if (!window._publicDataErrorLogged) {
+          console.error("Public data fetch failed:", err.message);
+          window._publicDataErrorLogged = true;
+        }
+      }
+    };
+    fetchPublicData();
+
+    // Refresh every 10 seconds (reduced from 5 to prevent flicker)
+    const publicInterval = setInterval(fetchPublicData, 10000);
+    return () => clearInterval(publicInterval);
   }, []);
 
   // 🔗 READ SHARED TICKET FROM URL
@@ -213,6 +309,99 @@ const App = () => {
         setCurrentRoundDisplay(currentRound.toString());
         const tickets = await lotto.getUserTickets(currentRound, userAddr);
         setMyTickets(tickets.map(t => t.toString()));
+
+        // 👑 Check Owner
+        const contractOwner = await lotto.owner();
+        if (contractOwner.toLowerCase() === userAddr.toLowerCase()) {
+          setIsOwner(true);
+        } else {
+          setIsOwner(false);
+        }
+
+        // 💰 Fetch Real Prize Pool
+        const roundData = await lotto.rounds(currentRound);
+        // rounds returns struct: [id, prizePool, winningNumber, isDrawn] - index 1 is prizePool based on ABI
+        // But rounds structure in solidity is struct, ethers returns Result object (array-like)
+        // prizePool is the 2nd element (index 1) if following struct order, or named property
+        const poolWei = roundData.prizePool;
+        const poolEth = parseFloat(ethers.formatUnits(poolWei, 18));
+        setCurrentPot(poolEth);
+
+        // 📜 Fetch History (Last 20 Rounds)
+        const historyData = [];
+        for (let i = 1; i <= 20; i++) {
+          if (currentRound - BigInt(i) < 1n) break;
+          const rId = currentRound - BigInt(i);
+          const rTickets = await lotto.getUserTickets(rId, userAddr);
+          if (rTickets.length > 0) {
+            const rInfo = await lotto.rounds(rId);
+            historyData.push({
+              round: rId.toString(),
+              tickets: rTickets.map(t => t.toString()),
+              winner: rInfo.winningNumber.toString(),
+              isWinner: rTickets.some(t => t.toString() === rInfo.winningNumber.toString())
+            });
+          }
+        }
+        setPastTickets(historyData);
+
+        // 🏆 CHECK FOR UNCLAIMED PRIZES
+        for (let i = 1; i <= 5; i++) {
+          const pastRoundId = currentRound - BigInt(i);
+          if (pastRoundId < 1n) break;
+
+          const pastRound = await lotto.rounds(pastRoundId);
+          if (!pastRound.isDrawn) continue;
+
+          const hasClaimed = await lotto.hasClaimed(pastRoundId, userAddr);
+          if (hasClaimed) continue;
+
+          const userTix = await lotto.getUserTickets(pastRoundId, userAddr);
+          const winNum = pastRound.winningNumber.toString();
+          const hasWinningTicket = userTix.some(t => t.toString() === winNum);
+
+          if (hasWinningTicket) {
+            // Found unclaimed prize!
+            const filter = lotto.filters.WinnerDrawn();
+            const events = await lotto.queryFilter(filter, 0, "latest");
+            const matchEvent = events.find(e => e.args[0].toString() === pastRoundId.toString());
+
+            let prizeAmount = 0;
+            if (matchEvent && matchEvent.args[3]) {
+              prizeAmount = parseFloat(ethers.formatUnits(matchEvent.args[3], 18));
+            }
+
+            setUnclaimedPrize({
+              roundId: pastRoundId.toString(),
+              amount: prizeAmount,
+              winningNumber: winNum
+            });
+            setShowWinModal(true);
+            break; // Show only first unclaimed
+          }
+        }
+
+        // 🏆 Fetch Global History (Events from Genesis)
+        try {
+          const filter = lotto.filters.WinnerDrawn();
+          const events = await lotto.queryFilter(filter, 0, "latest"); // From block 0 to latest
+
+          const globalHistory = events.map(e => {
+            const { roundId, winningNumber, winnerCount, prizePerWinner } = e.args;
+            return {
+              round: roundId.toString(),
+              number: winningNumber.toString(),
+              winnerCount: Number(winnerCount),
+              prize: parseFloat(ethers.formatUnits(prizePerWinner, 18)).toLocaleString() + " USDT"
+            };
+          }).reverse().slice(0, 10); // Take last 10
+
+          setHistory(globalHistory);
+        } catch (evtErr) {
+          console.error("Event Query Failed:", evtErr);
+          setHistory([]); // Fallback
+        }
+
       } catch (err) { console.error("Fetch tickets error:", err); }
     }
   }, []);
@@ -230,6 +419,30 @@ const App = () => {
     } else {
       if (!window.ethereum) return showNotification("Error", "MetaMask not found!", "error");
       try {
+        // 🔄 FORCE NETWORK SWITCH LOCALHOST (Chain ID 31337)
+        const chainId = "0x7A69"; // 31337 in hex
+        try {
+          await window.ethereum.request({
+            method: 'wallet_switchEthereumChain',
+            params: [{ chainId: chainId }],
+          });
+        } catch (switchError) {
+          // This error code indicates that the chain has not been added to MetaMask.
+          if (switchError.code === 4902) {
+            await window.ethereum.request({
+              method: 'wallet_addEthereumChain',
+              params: [
+                {
+                  chainId: chainId,
+                  chainName: 'Localhost 8545',
+                  rpcUrls: ['http://127.0.0.1:8545'],
+                  nativeCurrency: { name: 'ETH', symbol: 'ETH', decimals: 18 },
+                },
+              ],
+            });
+          }
+        }
+
         const _provider = new ethers.BrowserProvider(window.ethereum);
         const _signer = await _provider.getSigner();
         const _address = await _signer.getAddress();
@@ -259,9 +472,39 @@ const App = () => {
     }
   }, [playClick, fetchMyTickets, showNotification]);
 
+  // 🎰 ADMIN: Draw Winner (Real Chain)
+  const handleDrawWinner = useCallback(async () => {
+    if (!ticketNumber || ticketNumber.length !== 4) return showNotification("System Error", "Enter 4 digit winning number first!", "error");
+    setIsLoading(true);
+    try {
+      const lotto = new ethers.Contract(CONTRACT_ADDRESS, LOTTO_ABI, signer);
+      const tx = await lotto.drawWinner(ticketNumber);
+      showNotification("🎲 Drawing...", "Rolling the lucky number... Wait for confirm.", "info");
+      await tx.wait();
+      showNotification("🎉 WINNER DRAWN!", `Winning Number: ${ticketNumber} confirmed!`, "success");
+
+      // Refresh Data (No Reload! Keep Wallet Connected) 🔄
+      if (walletAddress) {
+        // Wait a bit for indexing
+        setTimeout(() => fetchMyTickets(walletAddress, signer), 2000);
+      }
+      setTicketNumber(""); // Clear Input
+
+    } catch (err) {
+      console.error(err);
+      showNotification("Draw Failed", err.reason || err.message, "error");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [ticketNumber, signer, showNotification, walletAddress, fetchMyTickets]);
+
   // ✅ Approve Handler (Stable)
   const handleApprove = useCallback(async () => {
     playClick();
+    if (!walletAddress) {
+      showNotification("Connect Wallet", "Connecting to your wallet...", "info");
+      return connectWallet();
+    }
     setIsLoading(true);
     try {
       if (USE_MOCK) {
@@ -320,7 +563,16 @@ const App = () => {
         setIsLoading(false);
       }
     } catch (err) {
-      showNotification("Claim Error", err.message || "No prize to claim or already claimed.", "error");
+      // Extract clean error message (remove hex data)
+      let cleanMsg = "No prize to claim or already claimed.";
+      if (err.reason) {
+        cleanMsg = err.reason;
+      } else if (err.message) {
+        // Try to extract text inside quotes like "No winners"
+        const match = err.message.match(/"([^"]+)"/);
+        cleanMsg = match ? match[1] : err.message.substring(0, 50);
+      }
+      showNotification("Claim Error", cleanMsg, "error");
       setIsLoading(false);
     }
   }, [playClick, mockHasClaimed, myTickets, currentRoundDisplay, winnerInfo, signer, showNotification]);
@@ -330,6 +582,11 @@ const App = () => {
     playClick();
     if (!walletAddress) return showNotification("Access Denied", "Connect wallet first.", "error");
     if (ticketNumber.length !== 4) return showNotification("Invalid Input", "Enter 4 digits.", "error");
+
+    // 🛡️ Prevent Duplicates Check
+    if (myTickets.includes(ticketNumber)) {
+      return showNotification("Duplicate Alert 🚫", `You already hold Ticket #${ticketNumber} for this round!`, "error");
+    }
 
     setIsLoading(true);
     try {
@@ -349,6 +606,10 @@ const App = () => {
         showNotification("Transaction Sent", "Waiting for confirmation...", "info");
         await tx.wait();
         await fetchMyTickets(walletAddress, signer);
+
+        // ⚡ Optimistic Update: Add 4 USDT instantly (80% of 5 USDT)
+        setCurrentPot(prev => prev + 4);
+
         showNotification("Mission Accomplished!", `Ticket #${ticketNumber} secured on Chain!`, "success");
       }
       setTicketNumber("");
@@ -359,6 +620,15 @@ const App = () => {
       setIsLoading(false);
     }
   }, [playClick, walletAddress, ticketNumber, signer, fetchMyTickets, showNotification]);
+
+  // 🔄 Auto-Refresh (Placed here to avoid ReferenceError)
+  useEffect(() => {
+    if (!walletAddress || USE_MOCK) return;
+    const interval = setInterval(() => {
+      fetchMyTickets(walletAddress, signer);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [walletAddress, signer, fetchMyTickets]);
 
   return (
     <div className="min-h-screen bg-black text-white font-sans relative overflow-x-hidden selection:bg-pink-500 selection:text-white">
@@ -398,7 +668,13 @@ const App = () => {
           {/* 🛠️ DEV BUTTON: Start New Round */}
           {USE_MOCK && (
             <button onClick={forceNextRound} aria-label="Start next round" className="text-[10px] md:text-xs text-white/30 hover:text-white border border-white/10 px-2 py-1 rounded-lg uppercase tracking-widest transition-all focus-visible:ring-2 focus-visible:ring-cyan-400 focus-visible:outline-none">
-              ⏳ Next Round
+              ⏳ Next Round (Mock)
+            </button>
+          )}
+          {/* 👑 ADMIN BUTTON */}
+          {!USE_MOCK && isOwner && (
+            <button onClick={handleDrawWinner} className="bg-purple-600 hover:bg-purple-500 text-white text-[10px] md:text-xs px-3 py-1 rounded-lg font-bold uppercase tracking-widest shadow-[0_0_15px_rgba(147,51,234,0.5)] animate-pulse">
+              🎰 Draw {ticketNumber || "???"}
             </button>
           )}
           <button
@@ -463,7 +739,7 @@ const App = () => {
                   className="w-full bg-black/40 border border-white/10 rounded-[1.5rem] md:rounded-[2rem] py-4 md:py-8 text-center text-4xl md:text-6xl font-mono tracking-[0.3em] md:tracking-[0.5em] focus:border-cyan-400 focus:bg-black/60 focus:shadow-[0_0_30px_rgba(6,182,212,0.2)] transition-colors outline-none text-white placeholder-white/5 focus-visible:ring-2 focus-visible:ring-cyan-400"
                 />
                 {!isApproved ? (
-                  <button onClick={handleApprove} disabled={isLoading || !walletAddress} aria-label="Approve USDT spending" className="w-full py-4 md:py-5 rounded-xl md:rounded-2xl font-bold text-base md:text-lg bg-gradient-to-r from-amber-400 to-orange-500 text-white hover:brightness-110 shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-colors focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none">
+                  <button onClick={handleApprove} disabled={isLoading} aria-label="Approve USDT spending" className="w-full py-4 md:py-5 rounded-xl md:rounded-2xl font-bold text-base md:text-lg bg-gradient-to-r from-amber-400 to-orange-500 text-white hover:brightness-110 shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-colors focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none">
                     {isLoading ? "Verifying…" : "🔐 Approve USDT"}
                   </button>
                 ) : (
@@ -478,83 +754,129 @@ const App = () => {
             </div>
           </div>
 
-          {/* Right Column: Golden Ticket Gallery (Interactive) */}
+          {/* Right Column: Unified Ticket Manager */}
           <div className="lg:col-span-5 space-y-6">
-            <div className="bg-gradient-to-br from-white/5 to-white/0 backdrop-blur-3xl p-6 md:p-8 rounded-[2rem] md:rounded-[2.5rem] border border-white/10 shadow-lg min-h-[400px] flex flex-col relative overflow-hidden">
+            <div className="bg-gradient-to-br from-white/5 to-white/0 backdrop-blur-3xl p-6 md:p-8 rounded-[2rem] md:rounded-[2.5rem] border border-white/10 shadow-lg min-h-[500px] flex flex-col relative overflow-hidden">
               <div className="absolute top-0 right-0 w-[100px] h-[100px] bg-purple-500/10 blur-[50px]"></div>
 
-              <div className="flex justify-between items-center mb-6 pb-4 border-b border-white/5 relative z-10">
-                <h3 className="text-lg md:text-xl font-bold text-white flex gap-2">🛸 My Tickets</h3>
-                <span className="bg-amber-500/20 border border-amber-500/30 px-3 py-1 rounded-full text-[10px] md:text-xs text-amber-200 shadow-[0_0_10px_rgba(245,158,11,0.2)]">{myTickets.length} Tickets</span>
+              {/* TABS HEADER */}
+              <div className="flex items-center gap-4 mb-6 pb-4 border-b border-white/5 relative z-10">
+                <button
+                  onClick={() => { playClick(); setViewHistoryTab(false); }}
+                  className={`text-lg md:text-xl font-bold transition-colors ${!viewHistoryTab ? 'text-white' : 'text-white/40 hover:text-white/70'}`}
+                >
+                  🛸 Active <span className="text-xs align-top opacity-50">{myTickets.length}</span>
+                </button>
+                <div className="w-[1px] h-6 bg-white/10"></div>
+                <button
+                  onClick={() => { playClick(); setViewHistoryTab(true); }}
+                  className={`text-lg md:text-xl font-bold transition-colors ${viewHistoryTab ? 'text-purple-300' : 'text-white/40 hover:text-purple-200'}`}
+                >
+                  📜 History
+                </button>
               </div>
 
-              {myTickets.length === 0 ? (
-                <div className="flex-1 flex flex-col items-center justify-center text-white/20">
-                  <div className="text-4xl mb-4 opacity-50 grayscale">🎟️</div><p>No tickets yet.</p>
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar relative z-10">
-                  {myTickets.map((tik, idx) => (
-                    // 🎫 GOLDEN TICKET CARD (Compact)
-                    <div
-                      key={idx}
-                      onClick={() => { playClick(); setSelectedTicket(tik); }} // 👈 Click Handler
-                      className="relative group transition-transform hover:scale-[1.02] duration-300 cursor-pointer"
-                    >
-                      {/* Aura Glow */}
-                      <div className="absolute -inset-0.5 bg-gradient-to-r from-yellow-400 to-amber-600 rounded-lg blur opacity-20 group-hover:opacity-60 transition duration-500"></div>
-
-                      {/* Ticket Body */}
-                      <div className="relative bg-gradient-to-br from-gray-900 to-black border border-amber-500/30 p-3 rounded-lg flex items-center justify-between overflow-hidden shadow-lg h-[90px]">
-
-                        {/* Metallic Texture */}
-                        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay"></div>
-
-                        {/* Left Side: Logo & Info */}
-                        <div className="flex flex-col z-10 pl-2">
-                          <span className="text-[9px] text-amber-400/80 uppercase tracking-widest font-bold">Golden Pass</span>
-                          <span className="text-2xl font-mono font-bold text-transparent bg-clip-text bg-gradient-to-b from-yellow-100 via-amber-400 to-yellow-600 drop-shadow-sm tracking-[0.1em] mt-0.5">
-                            {tik}
-                          </span>
-                        </div>
-
-                        {/* Divider Line */}
-                        <div className="w-[1px] h-8 border-l border-dashed border-white/10 mx-2"></div>
-
-                        {/* Right Side: Barcode */}
-                        <div className="flex flex-col items-center justify-center pr-2 opacity-70 scale-90">
-                          <div className="w-12 h-6 flex gap-[2px] justify-center items-end opacity-60">
-                            {[...Array(10)].map((_, i) => (
-                              <div key={i} className={`w-[2px] ${i % 2 === 0 ? 'h-full bg-amber-500' : 'h-2/3 bg-amber-500/50'}`}></div>
-                            ))}
-                          </div>
-                          <span className="text-[7px] text-amber-500/60 mt-1 uppercase tracking-wider">Inspect</span>
-                        </div>
-
-                        {/* Side Notches */}
-                        <div className="absolute -left-2 top-1/2 -translate-y-1/2 w-4 h-4 bg-[#0E0E14] rounded-full shadow-inner border-r border-amber-500/30"></div>
-                        <div className="absolute -right-2 top-1/2 -translate-y-1/2 w-4 h-4 bg-[#0E0E14] rounded-full shadow-inner border-l border-amber-500/30"></div>
-
-                      </div>
+              {/* TAB CONTENT: ACTIVE TICKETS */}
+              {!viewHistoryTab && (
+                <>
+                  {myTickets.length === 0 ? (
+                    <div className="flex-1 flex flex-col items-center justify-center text-white/20 animate-fade-in">
+                      <div className="text-4xl mb-4 opacity-50 grayscale">🎟️</div><p>No active tickets.</p>
+                      <p className="text-xs mt-2 opacity-50">Buy tickets for Round #{currentRoundDisplay}</p>
                     </div>
-                  ))}
+                  ) : (
+                    <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar relative z-10 animate-fade-in">
+                      {myTickets.map((tik, idx) => (
+                        // ... (Reuse existing Ticket UI) ...
+                        <div
+                          key={idx}
+                          onClick={() => { playClick(); setSelectedTicket(tik); }}
+                          className="relative group transition-transform hover:scale-[1.02] duration-300 cursor-pointer"
+                        >
+                          {/* Aura Glow */}
+                          <div className="absolute -inset-0.5 bg-gradient-to-r from-yellow-400 to-amber-600 rounded-lg blur opacity-20 group-hover:opacity-60 transition duration-500"></div>
+
+                          {/* Ticket Body */}
+                          <div className="relative bg-gradient-to-br from-gray-900 to-black border border-amber-500/30 p-3 rounded-lg flex items-center justify-between overflow-hidden shadow-lg h-[90px]">
+                            <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay"></div>
+                            <div className="flex flex-col z-10 pl-2">
+                              <span className="text-[9px] text-amber-400/80 uppercase tracking-widest font-bold">Golden Pass</span>
+                              <span className="text-2xl font-mono font-bold text-transparent bg-clip-text bg-gradient-to-b from-yellow-100 via-amber-400 to-yellow-600 drop-shadow-sm tracking-[0.1em] mt-0.5">{tik}</span>
+                            </div>
+                            <div className="w-[1px] h-8 border-l border-dashed border-white/10 mx-2"></div>
+                            <div className="flex flex-col items-center justify-center pr-2 opacity-70 scale-90">
+                              <div className="w-12 h-6 flex gap-[2px] justify-center items-end opacity-60">
+                                {[...Array(10)].map((_, i) => (<div key={i} className={`w-[2px] ${i % 2 === 0 ? 'h-full bg-amber-500' : 'h-2/3 bg-amber-500/50'}`}></div>))}
+                              </div>
+                              <span className="text-[7px] text-amber-500/60 mt-1 uppercase tracking-wider">Inspect</span>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* TAB CONTENT: HISTORY */}
+              {viewHistoryTab && (
+                <div className="animate-fade-in space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar pr-2">
+                  {pastTickets.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center pt-20 text-white/20">
+                      <div className="text-4xl mb-4 opacity-50">📜</div><p>No history found.</p>
+                    </div>
+                  ) : (
+                    pastTickets.map((round, idx) => (
+                      <div key={idx} className="bg-black/40 rounded-xl p-4 border border-white/5 relative overflow-hidden group hover:border-purple-500/30 transition-colors">
+                        <div className="flex justify-between items-center mb-3">
+                          <span className="text-xs text-purple-300 font-bold uppercase tracking-wider bg-purple-500/10 px-2 py-1 rounded">Round #{round.round}</span>
+                          {round.isWinner ?
+                            <span className="text-[10px] bg-green-500/20 text-green-300 px-2 py-0.5 rounded-full border border-green-500/30 flex items-center gap-1">WON 🎉</span> :
+                            <span className="text-[10px] bg-white/5 text-gray-400 px-2 py-0.5 rounded-full border border-white/5">Missed</span>
+                          }
+                        </div>
+                        <div className="flex flex-wrap gap-2 mb-3">
+                          {round.tickets.map((t, tIdx) => (
+                            <span key={tIdx} className={`font-mono text-lg px-3 py-1 rounded-lg border ${t === round.winner ? 'bg-yellow-500/20 border-yellow-500 text-yellow-300 shadow-[0_0_15px_rgba(234,179,8,0.3)]' : 'bg-white/5 border-white/10 text-white/70'}`}>
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                        <div className="pt-2 border-t border-white/5 text-[10px] text-gray-500 flex items-center gap-2 justify-end">
+                          <span className="uppercase tracking-widest opacity-70">Winning Number</span>
+                          <span className="text-yellow-500 font-mono text-sm bg-yellow-500/10 px-2 rounded border border-yellow-500/20">{round.winner}</span>
+                        </div>
+                      </div>
+                    ))
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Recent Winners */}
+            {/* Recent Winners (Global) - KEEP AS IS */}
             <div className="bg-gradient-to-br from-white/5 to-white/0 backdrop-blur-3xl p-6 md:p-8 rounded-[2rem] md:rounded-[2.5rem] border border-white/10 shadow-lg">
-              <h3 className="text-base md:text-lg font-bold text-white mb-4">🏆 Recent Victories</h3>
-              <div className="space-y-3">
-                {history.map((item, idx) => (
-                  <div key={idx} className="flex justify-between items-center p-3 bg-black/20 rounded-xl border border-white/5">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full bg-yellow-500/20 text-yellow-500 flex items-center justify-center font-bold text-xs shadow-lg">#{item.round}</div>
-                      <div className="font-mono text-white text-base tracking-wider">{item.number}</div>
+              <h3 className="text-base md:text-lg font-bold text-white mb-4">🏆 Global Winners</h3>
+              <div className="space-y-3 max-h-[400px] overflow-y-auto custom-scrollbar pr-2">
+                {history.length === 0 ? (
+                  <p className="text-white/30 text-center py-4 text-sm">Waiting for first draw...</p>
+                ) : (
+                  history.map((item, idx) => (
+                    <div key={idx} className="flex justify-between items-center p-3 bg-black/20 rounded-xl border border-white/5">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-full bg-yellow-500/20 text-yellow-500 flex items-center justify-center font-bold text-xs shadow-lg">#{item.round}</div>
+                        <div className="flex flex-col">
+                          <span className="font-mono text-white text-base tracking-wider leading-none">{item.number}</span>
+                          {/* Show 'No Winner' if count is 0 */}
+                          {item.winnerCount === 0 && <span className="text-[9px] text-red-400 mt-1 uppercase tracking-wide">No Winners 💀</span>}
+                          {item.winnerCount > 0 && <span className="text-[9px] text-green-400 mt-1 uppercase tracking-wide">{item.winnerCount} Winners</span>}
+                        </div>
+                      </div>
+                      <div className={`font-bold text-sm ${item.winnerCount === 0 ? 'text-gray-500 line-through' : 'text-emerald-400'}`}>
+                        {item.winnerCount === 0 ? "Rollover" : item.prize}
+                      </div>
                     </div>
-                    <div className="font-bold text-sm text-emerald-400">{item.prize}</div>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
           </div>
@@ -666,63 +988,91 @@ const App = () => {
         </div>
       )}
 
-      {/* --- 🏆 WINNER MODAL (Auto-Triggered) --- */}
-      {showWinModal && (
+      {/* --- 🏆 WINNER CELEBRATION MODAL --- */}
+      {showWinModal && unclaimedPrize && (
         <div className="fixed inset-0 z-[300] flex items-center justify-center p-4 animate-fade-in bg-black/90 backdrop-blur-xl">
           <div className="absolute inset-0 z-0 overflow-hidden" aria-hidden="true">
-            {/* Confetti Explosion - Static positions to avoid hydration mismatch */}
+            {/* Confetti Explosion */}
             {[[5, 12], [15, 8], [25, 45], [35, 22], [45, 67], [55, 33], [65, 78], [75, 15], [85, 55], [95, 42], [10, 88], [20, 72], [30, 95], [40, 5], [50, 38], [60, 82], [70, 28], [80, 62], [90, 18], [2, 50]].map(([top, left], i) => (
-              <div key={i} className="absolute w-2 h-2 bg-yellow-500 rounded-full animate-twinkle" style={{ top: `${top}%`, left: `${left}%`, animationDelay: `${i * 0.05}s` }}></div>
+              <div key={i} className="absolute w-3 h-3 rounded-full animate-twinkle"
+                style={{
+                  top: `${top}%`, left: `${left}%`, animationDelay: `${i * 0.05}s`,
+                  backgroundColor: ['#FFD700', '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4'][i % 5]
+                }}></div>
             ))}
           </div>
 
-          <div className="relative z-10 bg-gradient-to-b from-gray-900 via-gray-900 to-black border border-yellow-500/50 p-8 md:p-12 rounded-[3rem] shadow-[0_0_100px_rgba(234,179,8,0.3)] text-center max-w-lg w-full flex flex-col items-center">
+          <div className="relative z-10 bg-gradient-to-b from-gray-900 via-gray-900 to-black border-2 border-yellow-500/50 p-8 md:p-12 rounded-[3rem] shadow-[0_0_100px_rgba(234,179,8,0.4)] text-center max-w-lg w-full flex flex-col items-center">
 
-            <div className="text-6xl md:text-8xl mb-4 animate-bounce-slow">🎉</div>
+            {/* Trophy */}
+            <div className="text-7xl md:text-9xl mb-4 animate-bounce-slow drop-shadow-[0_0_30px_rgba(234,179,8,0.5)]">🏆</div>
 
-            <h2 className="text-4xl md:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 via-white to-yellow-300 drop-shadow-lg tracking-tight mb-2 uppercase">You Won!</h2>
-            <p className="text-yellow-100/60 font-light text-lg mb-8 tracking-widest uppercase">Big Winner Detected</p>
+            <h2 className="text-4xl md:text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 via-white to-yellow-300 drop-shadow-lg tracking-tight mb-2 uppercase">
+              Congratulations!
+            </h2>
+            <p className="text-yellow-100/60 font-light text-lg mb-6 tracking-widest uppercase">You Hit The Jackpot!</p>
 
-            <div className="bg-white/5 border border-white/10 rounded-2xl p-6 w-full mb-8 backdrop-blur-sm">
+            {/* Prize Info Card */}
+            <div className="bg-gradient-to-br from-yellow-500/10 to-amber-500/5 border border-yellow-500/30 rounded-2xl p-6 w-full mb-6 backdrop-blur-sm">
 
-              {/* 1. Total Prize Pool */}
-              <div className="flex justify-between items-end mb-2">
-                <span className="text-sm text-gray-400">Total Prize Pool</span>
-                <span className="text-xl font-mono text-yellow-400/80 tracking-widest">{winnerInfo.total.toLocaleString()} USDT</span>
+              {/* Round Info */}
+              <div className="flex justify-between items-center mb-4 pb-4 border-b border-yellow-500/20">
+                <span className="text-sm text-gray-400 uppercase tracking-wider">Round</span>
+                <span className="text-xl font-bold text-yellow-400">#{unclaimedPrize.roundId}</span>
               </div>
 
-              <div className="w-full h-px bg-white/10 my-3"></div>
+              {/* Winning Number */}
+              <div className="flex justify-between items-center mb-4 pb-4 border-b border-yellow-500/20">
+                <span className="text-sm text-gray-400 uppercase tracking-wider">Winning Number</span>
+                <span className="text-2xl font-mono font-black text-white tracking-[0.2em]">{unclaimedPrize.winningNumber}</span>
+              </div>
 
-              {winnerInfo.count > 1 ? (
-                // 2. Multiple Winners Case
-                <>
-                  <div className="flex justify-between items-end mb-2">
-                    <span className="text-sm text-gray-400">Total Winners</span>
-                    <span className="text-lg text-white font-bold">{winnerInfo.count} @ {winnerInfo.share.toLocaleString()} USDT</span>
-                  </div>
-                  <div className="flex justify-between items-end mt-4 p-3 bg-yellow-500/10 rounded-lg border border-yellow-500/20">
-                    <span className="text-sm text-yellow-200 font-bold uppercase">Your Share</span>
-                    <span className="text-3xl font-black text-yellow-400">{winnerInfo.share.toLocaleString()} <span className="text-sm font-normal text-yellow-500/60">USDT</span></span>
-                  </div>
-                </>
-              ) : (
-                // 3. Single Winner Case
-                <div className="flex justify-between items-end">
-                  <span className="text-sm text-gray-400">Your Prize</span>
-                  <span className="text-3xl font-bold text-white">{winnerInfo.total.toLocaleString()} <span className="text-sm text-gray-400">USDT</span></span>
+              {/* Your Prize */}
+              <div className="flex justify-between items-end pt-2">
+                <span className="text-sm text-yellow-200 font-bold uppercase">Your Prize</span>
+                <div className="text-right">
+                  <span className="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-yellow-300 to-amber-400">
+                    {unclaimedPrize.amount.toLocaleString()}
+                  </span>
+                  <span className="text-lg text-yellow-500/60 ml-2">USDT</span>
                 </div>
-              )}
+              </div>
             </div>
 
+            {/* CLAIM BUTTON */}
             <button
-              onClick={handleClaim}
+              onClick={async () => {
+                setIsLoading(true);
+                try {
+                  const lotto = new ethers.Contract(CONTRACT_ADDRESS, LOTTO_ABI, signer);
+                  const tx = await lotto.claimPrize(BigInt(unclaimedPrize.roundId));
+                  await tx.wait();
+                  showNotification("💰 Prize Claimed!", `You received ${unclaimedPrize.amount.toLocaleString()} USDT!`, "success");
+                  setShowWinModal(false);
+                  setUnclaimedPrize(null);
+                  // Refresh data
+                  if (walletAddress) fetchMyTickets(walletAddress, signer);
+                } catch (err) {
+                  const match = err.message?.match(/"([^"]+)"/);
+                  showNotification("Claim Failed", match ? match[1] : err.reason || "Transaction failed", "error");
+                } finally {
+                  setIsLoading(false);
+                }
+              }}
+              disabled={isLoading}
               aria-label="Claim your prize"
-              className="w-full py-4 rounded-xl bg-gradient-to-r from-yellow-500 to-amber-600 hover:scale-105 transition-transform shadow-[0_0_40px_rgba(234,179,8,0.5)] text-black font-black text-xl tracking-widest uppercase focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none"
+              className="w-full py-5 rounded-2xl bg-gradient-to-r from-yellow-400 via-yellow-500 to-amber-500 hover:scale-[1.02] active:scale-[0.98] transition-all shadow-[0_0_50px_rgba(234,179,8,0.5)] text-black font-black text-2xl tracking-wider uppercase focus-visible:ring-4 focus-visible:ring-yellow-300 focus-visible:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              CLAIM PRIZE 💰
+              {isLoading ? "Processing..." : "🎁 CLAIM NOW"}
             </button>
 
-            <button onClick={() => setShowWinModal(false)} aria-label="Close winner modal" className="mt-6 text-xs text-white/30 hover:text-white uppercase tracking-widest focus-visible:ring-2 focus-visible:ring-yellow-400 focus-visible:outline-none rounded-lg px-2 py-1">Close</button>
+            <button
+              onClick={() => { setShowWinModal(false); setUnclaimedPrize(null); }}
+              aria-label="Close winner modal"
+              className="mt-6 text-sm text-white/40 hover:text-white uppercase tracking-widest focus-visible:ring-2 focus-visible:ring-yellow-400 focus-visible:outline-none rounded-lg px-4 py-2 hover:bg-white/5 transition-colors"
+            >
+              Claim Later
+            </button>
           </div>
         </div>
       )}
@@ -730,14 +1080,28 @@ const App = () => {
       {/* Notification Toast */}
       {notification.show && (
         <div className="fixed bottom-10 right-10 z-[9999] animate-fade-in-up" role="alert" aria-live="polite">
-          <div className={`p-6 rounded-2xl shadow-2xl backdrop-blur-xl border border-white/10 flex items-center gap-4 max-w-sm
-             ${notification.type === 'success' ? 'bg-emerald-900/80 text-emerald-100' : 'bg-red-900/80 text-red-100'}`}>
-            <div className="text-2xl" aria-hidden="true">{notification.type === 'success' ? '🎉' : '⚠️'}</div>
-            <div>
-              <h4 className="font-bold">{notification.title}</h4>
-              <p className="text-sm opacity-80">{notification.message}</p>
+          <div className={`p-4 md:p-6 rounded-2xl shadow-2xl backdrop-blur-xl border border-white/10 flex items-start gap-3 md:gap-4 max-w-[300px] md:max-w-sm
+             ${notification.type === 'success' ? 'bg-emerald-900/90 text-emerald-100' :
+              notification.type === 'info' ? 'bg-blue-900/90 text-blue-100 border-blue-500/30' :
+                'bg-rose-900/90 text-rose-100 border-rose-500/30'}`}>
+            <div className="text-2xl mt-1 shrink-0" aria-hidden="true">
+              {notification.type === 'success' ? '🎉' : notification.type === 'info' ? 'ℹ️' : '⚠️'}
             </div>
-            <button onClick={() => setNotification({ ...notification, show: false })} aria-label="Dismiss notification" className="ml-auto text-xs opacity-50 hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white rounded">✕</button>
+            <div className="flex-1 overflow-hidden">
+              <h4 className="font-bold text-sm md:text-base mb-1">{notification.title}</h4>
+              <p className="text-xs md:text-sm opacity-90 break-words leading-relaxed max-h-[100px] overflow-y-auto custom-scrollbar">
+                {notification.message.includes("user rejected") || notification.message.includes("User denied")
+                  ? "Transaction cancelled by user."
+                  : notification.message.length > 150 ? notification.message.substring(0, 150) + "..." : notification.message}
+              </p>
+            </div>
+            <button
+              onClick={() => setNotification({ ...notification, show: false })}
+              aria-label="Dismiss notification"
+              className="absolute top-2 right-2 text-white/40 hover:text-white hover:bg-white/10 rounded-full w-6 h-6 flex items-center justify-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+            >
+              ✕
+            </button>
           </div>
         </div>
       )}
