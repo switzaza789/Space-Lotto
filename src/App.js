@@ -3,7 +3,9 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { ethers } from 'ethers';
 
 // ⚙️ CONFIGURATION
-const USE_MOCK = process.env.REACT_APP_USE_MOCK === 'true';
+// ⚙️ CONFIGURATION
+// Default 'true' for GitHub Pages / Demo unless .env says 'false' explicitly
+const USE_MOCK = process.env.REACT_APP_USE_MOCK !== 'false';
 const CONTRACT_ADDRESS = process.env.REACT_APP_CONTRACT_ADDRESS;
 const USDT_ADDRESS = process.env.REACT_APP_USDT_ADDRESS;
 
