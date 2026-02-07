@@ -9,7 +9,7 @@ const USDT_ADDRESS = process.env.REACT_APP_USDT_ADDRESS;
 
 // 📜 ABI
 const LOTTO_ABI = [
-  "function buyTicket(uint256 _chosenNumber) external",
+  "function buyTickets(uint256[] _chosenNumbers, address _referrer) external",
   "function currentRoundId() external view returns (uint256)",
   "function getUserTickets(uint256 _roundId, address _user) external view returns (uint256[])",
   "function claimPrize(uint256 _roundId) external",
@@ -17,8 +17,16 @@ const LOTTO_ABI = [
   "function hasClaimed(uint256, address) external view returns (bool)",
   "function owner() view returns (address)",
   "function drawWinner(uint256 _winningNumber) external",
-  "event WinnerDrawn(uint256 roundId, uint256 winningNumber, uint256 winnerCount, uint256 prizePerWinner)"
+  "function referralEarnings(address) external view returns (uint256)",
+  "function referralEarningsByRound(uint256, address) external view returns (uint256)",
+  "function referralCount(address) external view returns (uint256)",
+  "event WinnerDrawn(uint256 roundId, uint256 winningNumber, uint256 winnerCount, uint256 prizePerWinner)",
+  "event TicketBought(address indexed player, uint256 roundId, uint256 chosenNumber)",
+  "event PrizeClaimed(address indexed winner, uint256 amount)",
+  "event ReferralReward(address indexed referrer, address indexed buyer, uint256 amount)"
 ];
+
+
 
 const ERC20_ABI = [
   "function approve(address spender, uint256 amount) external returns (bool)",
@@ -125,7 +133,7 @@ const App = () => {
   const [myTickets, setMyTickets] = useState([]);
   const [pastTickets, setPastTickets] = useState([]); // 📜 History State
   const [selectedTicket, setSelectedTicket] = useState(null);
-  const [viewHistoryTab, setViewHistoryTab] = useState(false); // 🆕 Tab State
+  const [activeTab, setActiveTab] = useState("active"); // 🆕 Tab State ("active", "history", "referral")
   const [sharedViewMode, setSharedViewMode] = useState(false); // 🆕 Is viewing someone else's ticket?
   const [sharedRound, setSharedRound] = useState(null); // 🆕 Round from shared link
   const [mockHasClaimed, setMockHasClaimed] = useState(false);
@@ -144,6 +152,11 @@ const App = () => {
 
   // 🆕 History State
   const [history, setHistory] = useState([]);
+
+  // 👥 Referral State
+  const [refEarnings, setRefEarnings] = useState("0");
+  const [refEarningsCurrentRound, setRefEarningsCurrentRound] = useState("0");
+  const [refCount, setRefCount] = useState(0);
 
   // ⏰ Persistent Countdown Timer
   useEffect(() => {
@@ -320,12 +333,22 @@ const App = () => {
 
         // 💰 Fetch Real Prize Pool
         const roundData = await lotto.rounds(currentRound);
-        // rounds returns struct: [id, prizePool, winningNumber, isDrawn] - index 1 is prizePool based on ABI
-        // But rounds structure in solidity is struct, ethers returns Result object (array-like)
-        // prizePool is the 2nd element (index 1) if following struct order, or named property
         const poolWei = roundData.prizePool;
         const poolEth = parseFloat(ethers.formatUnits(poolWei, 18));
         setCurrentPot(poolEth);
+
+        // 👥 Fetch Referral Stats
+        try {
+          const earned = await lotto.referralEarnings(userAddr);
+          const earnedRound = await lotto.referralEarningsByRound(currentRound, userAddr);
+          const count = await lotto.referralCount(userAddr);
+
+          setRefEarnings(parseFloat(ethers.formatUnits(earned, 18)).toFixed(2));
+          setRefEarningsCurrentRound(parseFloat(ethers.formatUnits(earnedRound, 18)).toFixed(2));
+          setRefCount(Number(count));
+        } catch (e) {
+          console.warn("Referral stats fetch failed:", e);
+        }
 
         // 📜 Fetch History (Last 20 Rounds)
         const historyData = [];
@@ -388,11 +411,16 @@ const App = () => {
 
           const globalHistory = events.map(e => {
             const { roundId, winningNumber, winnerCount, prizePerWinner } = e.args;
+            // Count can be BigInt, prize too
+            const wCount = Number(winnerCount);
+            // If winnerCount > 0, prize is prizePerWinner. Else pot rolls over (we show 0 or "Rollover")
+            const prizeAmt = wCount > 0 ? parseFloat(ethers.formatUnits(prizePerWinner, 18)) : 0;
+
             return {
               round: roundId.toString(),
               number: winningNumber.toString(),
-              winnerCount: Number(winnerCount),
-              prize: parseFloat(ethers.formatUnits(prizePerWinner, 18)).toLocaleString() + " USDT"
+              winnerCount: wCount,
+              prize: wCount > 0 ? prizeAmt.toLocaleString() + " USDT" : "No Winners"
             };
           }).reverse().slice(0, 10); // Take last 10
 
@@ -577,49 +605,100 @@ const App = () => {
     }
   }, [playClick, mockHasClaimed, myTickets, currentRoundDisplay, winnerInfo, signer, showNotification]);
 
-  // 🎫 Buy Ticket Handler (Stable)
+  // 🎫 Buy Tickets Handler (Bulk Support)
   const handleBuy = useCallback(async () => {
     playClick();
     if (!walletAddress) return showNotification("Access Denied", "Connect wallet first.", "error");
-    if (ticketNumber.length !== 4) return showNotification("Invalid Input", "Enter 4 digits.", "error");
 
-    // 🛡️ Prevent Duplicates Check
-    if (myTickets.includes(ticketNumber)) {
-      return showNotification("Duplicate Alert 🚫", `You already hold Ticket #${ticketNumber} for this round!`, "error");
+    // 🔄 Parse and Clean Input (Support "1111, 2222, 3333")
+    const rawTickets = ticketNumber.split(/[, ]+/).filter(Boolean); // Split by comma or space
+    const validTickets = rawTickets.filter(t => /^\d{4}$/.test(t));
+
+    if (validTickets.length === 0) return showNotification("Invalid Input", "Enter 4-digit numbers (e.g. 1234, 5678)", "error");
+    if (validTickets.length > 20) return showNotification("Limit Exceeded", "Max 20 tickets per transaction.", "error");
+
+
+
+    // 🛡️ Auto-Remove Duplicates (1. ตัดซ้ำในชุดเดียวกัน)
+    const uniqueInput = [...new Set(validTickets)];
+    let hasRemovedSelf = uniqueInput.length < validTickets.length;
+
+    // 🛡️ Filter Owned Tickets (2. ตัดซ้ำกับที่มีอยู่แล้ว)
+    const finalTicketsToBuy = uniqueInput.filter(t => !myTickets.includes(t));
+    let hasRemovedOwned = finalTicketsToBuy.length < uniqueInput.length;
+
+    // ⚙️ Auto-Update Input & Notify if changes made
+    if (hasRemovedSelf || hasRemovedOwned) {
+      setTicketNumber(finalTicketsToBuy.join(", ")); // อัปเดตช่อง Input ทันที
+      const removedCount = validTickets.length - finalTicketsToBuy.length;
+      showNotification("Auto-Cleanup 🧹", `Removed ${removedCount} duplicate/owned tickets.`, "warning");
+
+      // ถ้าตัดจนหมดเกลี้ยง ให้หยุดเลย
+      if (finalTicketsToBuy.length === 0) {
+        return showNotification("Nothing New", "All numbers are duplicates or already owned.", "info");
+      }
+
+      // หยุดเพื่อให้ user เห็นว่าตัดออกแล้ว (กดซื้ออีกรอบเพื่อยืนยัน) 
+      // หรือจะให้ลุยต่อเลยก็ได้? ปกติ UX ที่ดีควรให้เห็นก่อน
+      // แต่ถ้าเอาเร็ว "ตัดแล้วลุยต่อเลย" ก็ได้ครับ
+      // ในที่นี้ผมขอเลือก "ลุยต่อเลย" เพื่อความสะดวกรวดเร็วตามโจทย์
+    } else {
+      // ถ้าไม่มีอะไรต้องตัด ก็เช็คว่าว่างเปล่าไหม
+      if (finalTicketsToBuy.length === 0) return;
     }
 
     setIsLoading(true);
+    const amountToPay = finalTicketsToBuy.length * 5; // 5 USDT per ticket
+
     try {
       if (USE_MOCK) {
-        await mockBlockchain.buyTicket(ticketNumber);
+        // Mock loop
+        for (const t of finalTicketsToBuy) {
+          await mockBlockchain.buyTicket(t);
+        }
         await fetchMyTickets();
-        setCurrentPot(prev => prev + 4);
-        showNotification("Success", "Ticket bought via Mock.", "success");
+        setCurrentPot(prev => prev + (finalTicketsToBuy.length * 4));
+        showNotification("Success", `Bought ${finalTicketsToBuy.length} tickets via Mock.`, "success");
       } else {
         const lotto = new ethers.Contract(CONTRACT_ADDRESS, LOTTO_ABI, signer);
         const usdt = new ethers.Contract(USDT_ADDRESS, ERC20_ABI, signer);
+
+        // Check Allowance for TOTAL Amount
         const allow = await usdt.allowance(walletAddress, CONTRACT_ADDRESS);
-        if (allow < ethers.parseUnits("5", 18)) {
-          throw new Error("Allowance not enough. Please Approve again.");
+        const requiredAllowance = ethers.parseUnits(amountToPay.toString(), 18);
+
+        if (allow < requiredAllowance) {
+          throw new Error(`Allowance low. Need approval for ${amountToPay} USDT.`);
         }
-        const tx = await lotto.buyTicket(ticketNumber);
-        showNotification("Transaction Sent", "Waiting for confirmation...", "info");
+
+        // 🔗 GET REFERRER
+        const urlParams = new URLSearchParams(window.location.search);
+        let referrer = urlParams.get('ref');
+        if (!referrer || !ethers.isAddress(referrer) || referrer.toLowerCase() === walletAddress.toLowerCase()) {
+          referrer = ethers.ZeroAddress;
+        }
+
+        // 🚀 BULK BUY TRANSACTION (ใช้ finalTicketsToBuy)
+        const tx = await lotto.buyTickets(finalTicketsToBuy, referrer);
+        showNotification("Transaction Sent", `Buying ${finalTicketsToBuy.length} tickets...`, "info");
         await tx.wait();
+
         await fetchMyTickets(walletAddress, signer);
 
-        // ⚡ Optimistic Update: Add 4 USDT instantly (80% of 5 USDT)
-        setCurrentPot(prev => prev + 4);
+        // ⚡ Optimistic Pot Update
+        setCurrentPot(prev => prev + (finalTicketsToBuy.length * 4));
 
-        showNotification("Mission Accomplished!", `Ticket #${ticketNumber} secured on Chain!`, "success");
+        showNotification("Mission Accomplished!", `${finalTicketsToBuy.length} Tickets Secured!`, "success");
       }
       setTicketNumber("");
     } catch (error) {
       console.error(error);
-      showNotification("Transaction Failed", error.message || error.reason, "error");
+      const msg = error.message.includes("allowance") ? error.message : (error.reason || error.message);
+      showNotification("Transaction Failed", msg, "error");
     } finally {
       setIsLoading(false);
     }
-  }, [playClick, walletAddress, ticketNumber, signer, fetchMyTickets, showNotification]);
+  }, [playClick, walletAddress, ticketNumber, myTickets, signer, fetchMyTickets, showNotification]);
 
   // 🔄 Auto-Refresh (Placed here to avoid ReferenceError)
   useEffect(() => {
@@ -724,19 +803,25 @@ const App = () => {
             <div className="bg-gradient-to-br from-white/5 to-white/0 backdrop-blur-3xl p-6 md:p-10 rounded-[2rem] md:rounded-[3rem] border border-white/10 shadow-2xl relative overflow-hidden group">
               <div className="flex justify-between items-center mb-6 md:mb-10">
                 <div>
-                  <h3 className="text-2xl md:text-3xl font-bold text-white mb-1 md:mb-2 text-shadow-glow">Buy Ticket</h3>
-                  <p className="text-gray-400 font-light text-sm md:text-base">Input your lucky coordinates</p>
+                  <h3 className="text-2xl md:text-3xl font-bold text-white mb-1 md:mb-2 text-shadow-glow">Buy Tickets</h3>
+                  <p className="text-gray-400 font-light text-sm md:text-base">Input single number (1234) or multiple (1111, 2222)</p>
                 </div>
                 <div className="h-10 w-10 md:h-12 md:w-12 rounded-full bg-gradient-to-br from-cyan-500 to-blue-600 flex items-center justify-center shadow-[0_0_20px_#06b6d4] animate-pulse-slow text-lg md:text-xl">⚡</div>
               </div>
 
               <div className="space-y-6 md:space-y-8">
                 <input
-                  type="text" maxLength="4" placeholder="0000" value={ticketNumber} disabled={isLoading}
-                  aria-label="Enter 4-digit ticket number"
+                  type="text" placeholder="0000, 1111, 2222" value={ticketNumber} disabled={isLoading}
+                  aria-label="Enter 4-digit ticket numbers separated by comma"
                   autoComplete="off"
-                  onChange={(e) => { playHover(); setTicketNumber(e.target.value.replace(/\D/, '')); }}
-                  className="w-full bg-black/40 border border-white/10 rounded-[1.5rem] md:rounded-[2rem] py-4 md:py-8 text-center text-4xl md:text-6xl font-mono tracking-[0.3em] md:tracking-[0.5em] focus:border-cyan-400 focus:bg-black/60 focus:shadow-[0_0_30px_rgba(6,182,212,0.2)] transition-colors outline-none text-white placeholder-white/5 focus-visible:ring-2 focus-visible:ring-cyan-400"
+                  onChange={(e) => {
+                    playHover();
+                    // 🪄 Auto-Format: เติม , ให้เองทุก 4 ตัวอักษร
+                    const raw = e.target.value.replace(/\D/g, ''); // เอาเฉพาะตัวเลข
+                    const formatted = raw.replace(/(\d{4})(?=\d)/g, '$1, '); // แทรก , ทุก 4 ตัว
+                    setTicketNumber(formatted);
+                  }}
+                  className="w-full bg-black/40 border border-white/10 rounded-[1.5rem] md:rounded-[2rem] py-4 md:py-8 text-center text-2xl md:text-4xl font-mono tracking-widest focus:border-cyan-400 focus:bg-black/60 focus:shadow-[0_0_30px_rgba(6,182,212,0.2)] transition-colors outline-none text-white placeholder-white/5 focus-visible:ring-2 focus-visible:ring-cyan-400"
                 />
                 {!isApproved ? (
                   <button onClick={handleApprove} disabled={isLoading} aria-label="Approve USDT spending" className="w-full py-4 md:py-5 rounded-xl md:rounded-2xl font-bold text-base md:text-lg bg-gradient-to-r from-amber-400 to-orange-500 text-white hover:brightness-110 shadow-[0_0_20px_rgba(245,158,11,0.3)] transition-colors focus-visible:ring-2 focus-visible:ring-white focus-visible:outline-none">
@@ -760,34 +845,40 @@ const App = () => {
               <div className="absolute top-0 right-0 w-[100px] h-[100px] bg-purple-500/10 blur-[50px]"></div>
 
               {/* TABS HEADER */}
-              <div className="flex items-center gap-4 mb-6 pb-4 border-b border-white/5 relative z-10">
+              <div className="flex items-center gap-4 mb-6 pb-4 border-b border-white/5 relative z-10 overflow-x-auto scrollbar-hide">
                 <button
-                  onClick={() => { playClick(); setViewHistoryTab(false); }}
-                  className={`text-lg md:text-xl font-bold transition-colors ${!viewHistoryTab ? 'text-white' : 'text-white/40 hover:text-white/70'}`}
+                  onClick={() => { playClick(); setActiveTab("active"); }}
+                  className={`text-lg md:text-xl font-bold transition-colors whitespace-nowrap ${activeTab === "active" ? 'text-white' : 'text-white/40 hover:text-white/70'}`}
                 >
                   🛸 Active <span className="text-xs align-top opacity-50">{myTickets.length}</span>
                 </button>
-                <div className="w-[1px] h-6 bg-white/10"></div>
+                <div className="w-[1px] h-6 bg-white/10 shrink-0"></div>
                 <button
-                  onClick={() => { playClick(); setViewHistoryTab(true); }}
-                  className={`text-lg md:text-xl font-bold transition-colors ${viewHistoryTab ? 'text-purple-300' : 'text-white/40 hover:text-purple-200'}`}
+                  onClick={() => { playClick(); setActiveTab("history"); }}
+                  className={`text-lg md:text-xl font-bold transition-colors whitespace-nowrap ${activeTab === "history" ? 'text-purple-300' : 'text-white/40 hover:text-purple-200'}`}
                 >
                   📜 History
+                </button>
+                <div className="w-[1px] h-6 bg-white/10 shrink-0"></div>
+                <button
+                  onClick={() => { playClick(); setActiveTab("referral"); }}
+                  className={`text-lg md:text-xl font-bold transition-colors whitespace-nowrap ${activeTab === "referral" ? 'text-emerald-300' : 'text-white/40 hover:text-emerald-200'}`}
+                >
+                  🤝 Referrals
                 </button>
               </div>
 
               {/* TAB CONTENT: ACTIVE TICKETS */}
-              {!viewHistoryTab && (
+              {activeTab === "active" && (
                 <>
                   {myTickets.length === 0 ? (
-                    <div className="flex-1 flex flex-col items-center justify-center text-white/20 animate-fade-in">
+                    <div className="flex-1 flex flex-col items-center justify-center text-white/20 animate-fade-in py-10">
                       <div className="text-4xl mb-4 opacity-50 grayscale">🎟️</div><p>No active tickets.</p>
                       <p className="text-xs mt-2 opacity-50">Buy tickets for Round #{currentRoundDisplay}</p>
                     </div>
                   ) : (
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 max-h-[500px] overflow-y-auto pr-2 custom-scrollbar relative z-10 animate-fade-in">
                       {myTickets.map((tik, idx) => (
-                        // ... (Reuse existing Ticket UI) ...
                         <div
                           key={idx}
                           onClick={() => { playClick(); setSelectedTicket(tik); }}
@@ -819,7 +910,7 @@ const App = () => {
               )}
 
               {/* TAB CONTENT: HISTORY */}
-              {viewHistoryTab && (
+              {activeTab === "history" && (
                 <div className="animate-fade-in space-y-4 max-h-[500px] overflow-y-auto custom-scrollbar pr-2">
                   {pastTickets.length === 0 ? (
                     <div className="flex flex-col items-center justify-center pt-20 text-white/20">
@@ -851,6 +942,51 @@ const App = () => {
                   )}
                 </div>
               )}
+
+              {/* TAB CONTENT: REFERRALS */}
+              {activeTab === "referral" && (
+                <div className="animate-fade-in space-y-6 pt-4">
+                  <div className="bg-gradient-to-br from-emerald-900/20 to-black/40 p-6 md:p-8 rounded-[2rem] border border-emerald-500/20 relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-[150px] h-[150px] bg-emerald-500/20 blur-[80px] pointer-events-none"></div>
+
+                    <div className="relative z-10 text-center mb-6">
+                      <h3 className="text-2xl font-bold text-white mb-2">Invite Friends & Earn</h3>
+                      <p className="text-emerald-200/60 text-sm">Create passive income by sharing your link. Earn 10% from every ticket bought using your link!</p>
+                    </div>
+
+                    <div className="bg-black/40 p-4 rounded-xl border border-white/10 flex flex-col md:flex-row items-center gap-3 mb-8 relative group">
+                      <code className="text-xs md:text-sm text-emerald-300 font-mono truncate w-full text-center md:text-left bg-transparent outline-none">
+                        {window.location.origin}?ref={walletAddress || "Connect Wallet"}
+                      </code>
+                      <button onClick={() => {
+                        if (!walletAddress) return showNotification("Error", "Connect Wallet First", "error");
+                        navigator.clipboard.writeText(`${window.location.origin}?ref=${walletAddress}`);
+                        showNotification("Copied!", "Referral link copied!", "success");
+                      }} className="w-full md:w-auto text-emerald-900 bg-emerald-400 hover:bg-emerald-300 font-bold text-xs uppercase px-4 py-2 rounded-lg transition-colors shadow-lg shadow-emerald-500/20">
+                        Copy Link
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="bg-black/30 p-4 rounded-2xl border border-white/5 flex flex-col items-center justify-center transform hover:scale-105 transition-transform duration-300">
+                        <div className="text-3xl md:text-4xl font-black text-white mb-1 drop-shadow-lg">{refCount}</div>
+                        <div className="text-[10px] md:text-xs text-gray-400 uppercase tracking-widest font-bold">Total Invites</div>
+                      </div>
+                      <div className="bg-gradient-to-b from-emerald-900/20 to-emerald-900/10 p-4 rounded-2xl border border-emerald-500/20 flex flex-col items-center justify-center transform hover:scale-105 transition-transform duration-300">
+                        <div className="flex flex-col items-center">
+                          <span className="text-3xl md:text-4xl font-black text-emerald-400 drop-shadow-[0_0_15px_rgba(52,211,153,0.5)]">{refEarnings}</span>
+                          <span className="text-[10px] md:text-[10px] text-emerald-200/60 uppercase tracking-widest font-bold">Total Earned</span>
+                        </div>
+                        <div className="w-full h-[1px] bg-emerald-500/20 my-2"></div>
+                        <div className="flex flex-col items-center">
+                          <span className="text-xl md:text-2xl font-bold text-emerald-300">{refEarningsCurrentRound}</span>
+                          <span className="text-[9px] md:text-[10px] text-emerald-200/40 uppercase tracking-widest font-bold">This Round</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Recent Winners (Global) - KEEP AS IS */}
@@ -866,13 +1002,12 @@ const App = () => {
                         <div className="w-8 h-8 rounded-full bg-yellow-500/20 text-yellow-500 flex items-center justify-center font-bold text-xs shadow-lg">#{item.round}</div>
                         <div className="flex flex-col">
                           <span className="font-mono text-white text-base tracking-wider leading-none">{item.number}</span>
-                          {/* Show 'No Winner' if count is 0 */}
-                          {item.winnerCount === 0 && <span className="text-[9px] text-red-400 mt-1 uppercase tracking-wide">No Winners 💀</span>}
                           {item.winnerCount > 0 && <span className="text-[9px] text-green-400 mt-1 uppercase tracking-wide">{item.winnerCount} Winners</span>}
+                          {item.winnerCount === 0 && <span className="text-[9px] text-red-400 mt-1 uppercase tracking-wide">No Winners 💀</span>}
                         </div>
                       </div>
-                      <div className={`font-bold text-sm ${item.winnerCount === 0 ? 'text-gray-500 line-through' : 'text-emerald-400'}`}>
-                        {item.winnerCount === 0 ? "Rollover" : item.prize}
+                      <div className={`font-bold text-sm ${item.winnerCount === 0 ? 'text-gray-500 italic' : 'text-emerald-400'}`}>
+                        {item.prize}
                       </div>
                     </div>
                   ))

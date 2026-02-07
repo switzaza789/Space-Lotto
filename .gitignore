@@ -32,3 +32,4 @@ yarn-error.log*
 *.cert
 secrets.json
 config.js
+.env

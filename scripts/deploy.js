@@ -4,18 +4,24 @@ async function main() {
     const [deployer] = await hre.ethers.getSigners();
     console.log("Deploying contracts with the account:", deployer.address);
 
-    // 1. Deploy เหรียญ USDT ปลอม
+    // Define devWallet and reserveWallet for the SpaceLotto deployment
+    // Assuming they are the deployer for this script, as in the original code.
+    const devWallet = deployer.address;
+    const reserveWallet = deployer.address;
+
+    // 1. Deploy MockUSDT
     const MockUSDT = await hre.ethers.getContractFactory("MockUSDT");
     const usdt = await MockUSDT.deploy();
-    await usdt.waitForDeployment();
-    const usdtAddress = await usdt.getAddress();
-    console.log("✅ MockUSDT deployed to:", usdtAddress);
+    await usdt.waitForDeployment(); // Updated for newer ethers/hardhat
+    const usdtAddr = await usdt.getAddress();
+    console.log("✅ MockUSDT deployed to:", usdtAddr);
 
-    // 2. Deploy ตู้หวย
+    // 2. Deploy SpaceLottoSimple
     const SpaceLotto = await hre.ethers.getContractFactory("SpaceLottoSimple");
-    const lotto = await SpaceLotto.deploy(usdtAddress, deployer.address, deployer.address);
+    const lotto = await SpaceLotto.deploy(usdtAddr, devWallet, reserveWallet);
     await lotto.waitForDeployment();
-    console.log("✅ SpaceLottoSimple deployed to:", await lotto.getAddress());
+    const lottoAddr = await lotto.getAddress();
+    console.log("✅ SpaceLottoSimple deployed to:", lottoAddr);
 }
 
 main().catch((error) => {
